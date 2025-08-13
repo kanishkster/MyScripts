@@ -3,61 +3,96 @@
 # Second arg: "dry-run" or "delete"
 
 INSTANCE_ID=$1
-ACTION=${2:-dry-run}  # default dry run
-REGION="ap-southeast-2"  # change to your region
+ACTION=${2:-dry-run}
+REGION="ap-southeast-2" # Change if needed
 
 if [ -z "$INSTANCE_ID" ]; then
     echo "Usage: $0 <instance-id> [dry-run|delete]"
     exit 1
 fi
 
+if ! command -v jq &> /dev/null; then
+    echo "jq is required but not installed."
+    exit 1
+fi
+
 echo "=== Gathering resources for EC2 instance $INSTANCE_ID in $REGION ==="
 
-# 1. Get instance details
+# Instance details
 INSTANCE_INFO=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --region $REGION)
 if [ $? -ne 0 ]; then
     echo "Error: Instance not found."
     exit 1
 fi
 
-# 2. Get EBS Volumes
+PRIVATE_IP=$(echo $INSTANCE_INFO | jq -r '.Reservations[].Instances[].PrivateIpAddress')
+PUBLIC_IP=$(echo $INSTANCE_INFO | jq -r '.Reservations[].Instances[].PublicIpAddress')
+
+echo "Private IP: $PRIVATE_IP"
+echo "Public IP: $PUBLIC_IP"
+
+# EBS Volumes
 VOLUMES=$(echo $INSTANCE_INFO | jq -r '.Reservations[].Instances[].BlockDeviceMappings[].Ebs.VolumeId')
 echo "EBS Volumes: $VOLUMES"
 
-# 3. Get Elastic IPs
+# Elastic IPs
 EIPS=$(aws ec2 describe-addresses --filters "Name=instance-id,Values=$INSTANCE_ID" --region $REGION --query "Addresses[].AllocationId" --output text)
 echo "Elastic IPs: $EIPS"
 
-# 4. Get Security Groups
+# Security Groups
 SGS=$(echo $INSTANCE_INFO | jq -r '.Reservations[].Instances[].SecurityGroups[].GroupId')
 echo "Security Groups: $SGS"
 
-# 5. Get ENIs
+# ENIs
 ENIS=$(echo $INSTANCE_INFO | jq -r '.Reservations[].Instances[].NetworkInterfaces[].NetworkInterfaceId')
 echo "ENIs: $ENIS"
 
-# 6. Get IAM Role
+# IAM Role
 IAM_PROFILE=$(echo $INSTANCE_INFO | jq -r '.Reservations[].Instances[].IamInstanceProfile.Arn')
 echo "IAM Instance Profile: $IAM_PROFILE"
 
-# 7. Get CloudWatch Alarms
+# CloudWatch Alarms
 ALARM_NAMES=$(aws cloudwatch describe-alarms --region $REGION --query "MetricAlarms[?Dimensions[?Name=='InstanceId' && Value=='$INSTANCE_ID']].AlarmName" --output text)
 echo "CloudWatch Alarms: $ALARM_NAMES"
 
-# 8. Perform Actions
+# Route53 DNS Records
+echo "Checking Route53 records..."
+for ZONE_ID in $(aws route53 list-hosted-zones --query "HostedZones[].Id" --output text); do
+    aws route53 list-resource-record-sets --hosted-zone-id $ZONE_ID --query "ResourceRecordSets[?ResourceRecords[?Value=='$PUBLIC_IP' || Value=='$PRIVATE_IP']]" --output table
+done
+
+# Load Balancer Target Groups
+echo "Checking Load Balancer target groups..."
+TARGET_GROUPS=$(aws elbv2 describe-target-groups --region $REGION --query "TargetGroups[].TargetGroupArn" --output text)
+for TG in $TARGET_GROUPS; do
+    MATCH=$(aws elbv2 describe-target-health --target-group-arn $TG --region $REGION --query "TargetHealthDescriptions[?Target.Id=='$INSTANCE_ID'].Target.Id" --output text)
+    if [ "$MATCH" == "$INSTANCE_ID" ]; then
+        echo "Instance found in Target Group: $TG"
+    fi
+done
+
+# SSM Associations
+SSM_ASSOCS=$(aws ssm list-associations --region $REGION --query "Associations[?Targets[?Values[?contains(@, '$INSTANCE_ID')]]].AssociationId" --output text)
+echo "SSM Associations: $SSM_ASSOCS"
+
 if [ "$ACTION" == "delete" ]; then
     echo "=== Deleting resources ==="
 
-    # Stop instance first
+    # Stop instance
     aws ec2 stop-instances --instance-ids $INSTANCE_ID --region $REGION
     aws ec2 wait instance-stopped --instance-ids $INSTANCE_ID --region $REGION
+
+    # Remove from Target Groups
+    for TG in $TARGET_GROUPS; do
+        aws elbv2 deregister-targets --target-group-arn $TG --targets Id=$INSTANCE_ID --region $REGION
+    done
 
     # Remove EIPs
     for EIP in $EIPS; do
         aws ec2 release-address --allocation-id $EIP --region $REGION
     done
 
-    # Detach and delete EBS Volumes
+    # Delete EBS Volumes
     for VOL in $VOLUMES; do
         aws ec2 detach-volume --volume-id $VOL --region $REGION
         aws ec2 delete-volume --volume-id $VOL --region $REGION
@@ -68,7 +103,7 @@ if [ "$ACTION" == "delete" ]; then
         aws ec2 delete-network-interface --network-interface-id $ENI --region $REGION
     done
 
-    # Delete Security Groups (skip default)
+    # Delete Security Groups
     for SG in $SGS; do
         if [ "$SG" != "sg-xxxxxxxx" ]; then
             aws ec2 delete-security-group --group-id $SG --region $REGION
@@ -89,7 +124,12 @@ if [ "$ACTION" == "delete" ]; then
         aws cloudwatch delete-alarms --alarm-names "$ALARM" --region $REGION
     done
 
-    # Terminate instance
+    # Delete SSM Associations
+    for ASSOC in $SSM_ASSOCS; do
+        aws ssm delete-association --association-id $ASSOC --region $REGION
+    done
+
+    # Terminate Instance
     aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region $REGION
     aws ec2 wait instance-terminated --instance-ids $INSTANCE_ID --region $REGION
 
